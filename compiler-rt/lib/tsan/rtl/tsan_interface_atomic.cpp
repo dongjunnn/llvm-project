@@ -25,6 +25,7 @@
 #include "tsan_flags.h"
 #include "tsan_interface.h"
 #include "tsan_rtl.h"
+#include "tsan_rtl_aba.h"
 
 using namespace __tsan;
 
@@ -268,7 +269,10 @@ struct OpLoad {
     if (!IsAcquireOrder(mo)) {
       MemoryAccess(thr, pc, (uptr)a, AccessSize<T>(),
                    kAccessRead | kAccessAtomic);
-      return NoTsanAtomic(mo, a);
+      T v = NoTsanAtomic(mo, a);
+      if (sizeof(T) == sizeof(uptr))  // ABA: only pointer-sized atomics
+        AbaRecordLoad((uptr)a, (uptr)v);
+      return v;
     }
     // Don't create sync object if it does not exist yet. For example, an atomic
     // pointer is initialized to nullptr and then periodically acquire-loaded.
@@ -284,6 +288,8 @@ struct OpLoad {
     }
     MemoryAccess(thr, pc, (uptr)a, AccessSize<T>(),
                  kAccessRead | kAccessAtomic);
+    if (sizeof(T) == sizeof(uptr))  // ABA: only pointer-sized atomics
+      AbaRecordLoad((uptr)a, (uptr)v);
     return v;
   }
 };
@@ -445,8 +451,11 @@ struct OpCAS {
     if (LIKELY(mo == mo_relaxed && fmo == mo_relaxed)) {
       T cc = *c;
       T pr = func_cas(a, cc, v);
-      if (pr == cc)
+      if (pr == cc) {
+        if (sizeof(T) == sizeof(uptr))  // ABA: only pointer-sized atomics
+          AbaCheckCas((uptr)a, (uptr)cc);
         return true;
+      }
       *c = pr;
       return false;
     }
@@ -463,6 +472,8 @@ struct OpCAS {
         *c = pr;
         mo = fmo;
       }
+      if (success && sizeof(T) == sizeof(uptr))  // ABA: only pointer-sized atomics
+        AbaCheckCas((uptr)a, (uptr)cc);
       if (success && IsAcqRelOrder(mo))
         thr->clock.ReleaseAcquire(&s->clock);
       else if (success && IsReleaseOrder(mo))

@@ -25,6 +25,8 @@
 
 namespace __tsan {
 
+static atomic_uint64_t g_aba_epoch = {1};
+
 struct MapUnmapCallback {
   void OnMap(uptr p, uptr size) const { }
   void OnMapSecondary(uptr p, uptr size, uptr user_begin,
@@ -278,6 +280,11 @@ void OnUserAlloc(ThreadState *thr, uptr pc, uptr p, uptr sz, bool write) {
   // which iterates over and resets all sync objects,
   // but it is fine to create new MBlocks in this context.
   ctx->metamap.AllocBlock(thr, pc, p, sz);
+  if (MBlock *b = ctx->metamap.GetBlock(p)) {
+    // Cycle through 1..255; 0 means "dead/untracked" and must never be stamped.
+    u64 e = atomic_fetch_add(&g_aba_epoch, 1, memory_order_relaxed);
+    b->alloc_epoch = e % 255 + 1;
+  }
   // If this runs before thread initialization/after finalization
   // and we don't have trace initialized, we can't imitate writes.
   // In such case just reset the shadow range, it is fine since
@@ -298,6 +305,9 @@ void OnUserFree(ThreadState *thr, uptr pc, uptr p, bool write) {
     return;
   }
   SlotLocker locker(thr);
+  // ABA detection: zero the epoch so a recycled chunk gets a fresh stamp
+  if (MBlock *b = ctx->metamap.GetBlock(p))
+    b->alloc_epoch = 0;
   uptr sz = ctx->metamap.FreeBlock(thr->proc(), p, true);
   DPrintf("#%d: free(0x%zx, %zu)\n", thr->tid, p, sz);
   if (write && thr->ignore_reads_and_writes == 0)
@@ -447,6 +457,12 @@ void FreeImpl(void *p) {
   }
   InternalAllocAccess();
   InternalFree(p, &thr->proc()->internal_alloc_cache);
+}
+
+u8 GetAllocEpoch(uptr p) {
+  if (MBlock *b = ctx->metamap.GetBlock(p))
+    return b->alloc_epoch;
+  return 0;
 }
 
 }  // namespace __tsan

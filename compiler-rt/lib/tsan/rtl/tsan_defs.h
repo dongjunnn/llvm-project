@@ -181,8 +181,9 @@ enum : AccessType {
 
 // Descriptor of user's memory block.
 struct MBlock {
-  u64  siz : 48;
+  u64  siz : 40;
   u64  tag : 16;
+  u64  alloc_epoch : 8;
   StackID stk;
   Tid tid;
 };
