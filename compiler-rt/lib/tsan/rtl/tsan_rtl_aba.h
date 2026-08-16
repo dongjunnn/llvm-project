@@ -1,11 +1,41 @@
+//===-- tsan_rtl_aba.h ------------------------------------------*- C++ -*-===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file is a part of ThreadSanitizer (TSan), a race detector.
+//
+// ABA detection. Every tracked object carries a monotonic allocation epoch.
+// A successful CAS checks that the epoch under the expected pointer still
+// matches the one recorded at the load that produced it.
+//
+//===----------------------------------------------------------------------===//
 #ifndef TSAN_RTL_ABA_H
 #define TSAN_RTL_ABA_H
 
+#include "sanitizer_common/sanitizer_atomic.h"
 #include "sanitizer_common/sanitizer_common.h"
 #include "tsan_defs.h"
-#include "tsan_mman.h"
 
 namespace __tsan {
+
+#if SANITIZER_GO
+
+// Go has its own allocator and no annotation API; the detector is C/C++ only.
+static inline void AbaRecordLoad(uptr addr, uptr value) {}
+static inline void AbaCheckCas(uptr addr, uptr expected) {}
+
+#else
+
+// Monotonic allocation identity; 0 is reserved for dead or untracked memory.
+extern atomic_uint64_t g_aba_epoch;
+
+// Epoch of the object starting at p, or 0 if p starts no tracked object.
+// Resolves heap blocks first, then annotated pool slots.
+u64 GetPointerEpoch(uptr p);
 
 // Per-thread cache: 16 sets x 4 ways, keyed by the atomic variable's address.
 static const uptr kAbaSets = 16;
@@ -14,7 +44,7 @@ static const uptr kAbaWays = 4;
 struct AbaEntry {
   uptr addr;        // atomic variable address (key); 0 == empty
   uptr loaded_ptr;  // pointer value observed at load
-  u8   epoch;       // its alloc epoch at load time
+  u64  epoch;       // its alloc epoch at load time
   u32  lru;         // last-touch tick, for eviction
 };
 
@@ -23,16 +53,18 @@ struct AbaCache {
   u32 tick;
 };
 
+// Defined out of line: a static definition here would give each including
+// translation unit its own copy, splitting the record path from the check path.
 __attribute__((tls_model("initial-exec")))
-static THREADLOCAL AbaCache aba_cache;
+extern THREADLOCAL AbaCache aba_cache;
 
 static inline uptr AbaSetIndex(uptr addr) {
   return (addr >> 3) & (kAbaSets - 1);  // atomics are >= pointer-aligned
 }
 
-// Record a loaded pointer's epoch. Non-heap values (epoch 0) are ignored.
+// Record a loaded pointer's epoch. Untracked values (epoch 0) are ignored.
 static inline void AbaRecordLoad(uptr addr, uptr value) {
-  u8 epoch = GetAllocEpoch(value);
+  u64 epoch = GetPointerEpoch(value);
   if (epoch == 0)
     return;
   AbaEntry *set = aba_cache.sets[AbaSetIndex(addr)];
@@ -51,8 +83,7 @@ static inline void AbaRecordLoad(uptr addr, uptr value) {
   slot->lru = ++aba_cache.tick;
 }
 
-// On a successful CAS, fire if `expected`'s current epoch differs from the one
-// recorded at load time -- i.e. the object was freed and reallocated.
+// On a successful CAS, fire if expected's epoch changed since the load.
 static inline void AbaCheckCas(uptr addr, uptr expected) {
   AbaEntry *set = aba_cache.sets[AbaSetIndex(addr)];
   AbaEntry *e = nullptr;
@@ -64,7 +95,7 @@ static inline void AbaCheckCas(uptr addr, uptr expected) {
   }
   if (!e || e->loaded_ptr != expected)
     return;
-  u8 now = GetAllocEpoch(expected);
+  u64 now = GetPointerEpoch(expected);
   if (now != e->epoch) {
     Printf(
         "==================\n"
@@ -72,13 +103,16 @@ static inline void AbaCheckCas(uptr addr, uptr expected) {
         "change)\n"
         "  Confidence: HIGH -- object at %p was freed and reallocated\n"
         "  Atomic variable at:        %p\n"
-        "  Allocation epoch at load:  %u\n"
-        "  Allocation epoch at CAS:   %u\n"
+        "  Allocation epoch at load:  %llu\n"
+        "  Allocation epoch at CAS:   %llu\n"
         "==================\n",
-        (void *)expected, (void *)addr, (unsigned)e->epoch, (unsigned)now);
+        (void *)expected, (void *)addr, (unsigned long long)e->epoch,
+        (unsigned long long)now);
     e->addr = 0;  // consume; don't re-report this slot
   }
 }
+
+#endif  // SANITIZER_GO
 
 }  // namespace __tsan
 

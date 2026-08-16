@@ -24,6 +24,19 @@ extern "C" {
 void SANITIZER_CDECL __tsan_acquire(void *addr);
 void SANITIZER_CDECL __tsan_release(void *addr);
 
+// Annotations for custom allocators, for ABA detection.
+// Objects from malloc/free and operator new/delete are tracked automatically.
+// Pool, slab and arena allocators are not: their whole backing region is one
+// heap block whose identity never changes, so recycling a slot within it is
+// invisible. Annotate the allocator itself, not its call sites. Leaving an
+// allocator unannotated is not an error; its slots are simply skipped.
+
+// Annotate handout of a slot.
+void SANITIZER_CDECL __tsan_aba_pool_alloc(void *addr);
+
+// Annotate return of a slot, before it goes back on the freelist.
+void SANITIZER_CDECL __tsan_aba_pool_free(void *addr);
+
 // Annotations for custom mutexes.
 // The annotations allow to get better reports (with sets of locked mutexes),
 // detect more types of bugs (e.g. mutex misuses, races between lock/unlock and

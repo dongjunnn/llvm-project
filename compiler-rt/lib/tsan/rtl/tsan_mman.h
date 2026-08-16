@@ -76,7 +76,5 @@ void DestroyAndFree(T *&p) {
   Free(p);
 }
 
-u8 GetAllocEpoch(uptr p);
-
 }  // namespace __tsan
 #endif  // TSAN_MMAN_H

@@ -22,10 +22,9 @@
 #include "tsan_interface.h"
 #include "tsan_report.h"
 #include "tsan_rtl.h"
+#include "tsan_rtl_aba.h"
 
 namespace __tsan {
-
-static atomic_uint64_t g_aba_epoch = {1};
 
 struct MapUnmapCallback {
   void OnMap(uptr p, uptr size) const { }
@@ -457,12 +456,6 @@ void FreeImpl(void *p) {
   }
   InternalAllocAccess();
   InternalFree(p, &thr->proc()->internal_alloc_cache);
-}
-
-u8 GetAllocEpoch(uptr p) {
-  if (MBlock *b = ctx->metamap.GetBlock(p))
-    return b->alloc_epoch;
-  return 0;
 }
 
 }  // namespace __tsan
