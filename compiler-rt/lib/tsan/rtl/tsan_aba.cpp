@@ -95,6 +95,11 @@ static u64 PoolLookup(uptr p) {
 }
 
 u64 GetPointerEpoch(uptr p) {
+  // Every pointer-sized atomic value lands here, including integers and
+  // tagged pointers. GetBlock computes a meta address from p without a range
+  // check, so a value outside application memory would fault.
+  if (!IsAppMem(p))
+    return 0;
   if (MBlock *b = ctx->metamap.GetBlock(p))
     return b->alloc_epoch;
   if (atomic_load(&g_pool_used, memory_order_relaxed) == 0)

@@ -312,6 +312,8 @@ struct OpStore {
     DCHECK(IsStoreOrder(mo));
     MemoryAccess(thr, pc, (uptr)a, AccessSize<T>(),
                  kAccessWrite | kAccessAtomic);
+    if (sizeof(T) == sizeof(uptr))  // ABA: the storer now knows a holds v
+      AbaRecordLoad((uptr)a, (uptr)v);
     // This fast-path is critical for performance.
     // Assume the access is atomic.
     // Strictly saying even relaxed store cuts off release sequence,
@@ -452,11 +454,15 @@ struct OpCAS {
       T cc = *c;
       T pr = func_cas(a, cc, v);
       if (pr == cc) {
-        if (sizeof(T) == sizeof(uptr))  // ABA: only pointer-sized atomics
+        if (sizeof(T) == sizeof(uptr)) {  // ABA: only pointer-sized atomics
           AbaCheckCas((uptr)a, (uptr)cc);
+          AbaRecordLoad((uptr)a, (uptr)v);  // the CAS stored v
+        }
         return true;
       }
       *c = pr;
+      if (sizeof(T) == sizeof(uptr))  // ABA: a failed CAS is a load of pr
+        AbaRecordLoad((uptr)a, (uptr)pr);
       return false;
     }
     SlotLocker locker(thr);
@@ -471,9 +477,13 @@ struct OpCAS {
       if (!success) {
         *c = pr;
         mo = fmo;
+        if (sizeof(T) == sizeof(uptr))  // ABA: a failed CAS is a load of pr
+          AbaRecordLoad((uptr)a, (uptr)pr);
       }
-      if (success && sizeof(T) == sizeof(uptr))  // ABA: only pointer-sized atomics
+      if (success && sizeof(T) == sizeof(uptr)) {  // ABA: only pointer-sized atomics
         AbaCheckCas((uptr)a, (uptr)cc);
+        AbaRecordLoad((uptr)a, (uptr)v);  // the CAS stored v
+      }
       if (success && IsAcqRelOrder(mo))
         thr->clock.ReleaseAcquire(&s->clock);
       else if (success && IsReleaseOrder(mo))
