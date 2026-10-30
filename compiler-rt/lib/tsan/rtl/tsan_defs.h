@@ -182,8 +182,8 @@ enum : AccessType {
 // Descriptor of user's memory block.
 struct MBlock {
   u64  siz : 40;
-  u64  tag : 16;
-  u64  alloc_epoch : 8;
+  u64  tag : 11;          // kExternalTagMax = 1024 fits
+  u64  alloc_epoch : 13;  // ABA: 1..8191, 0 = dead/untracked
   StackID stk;
   Tid tid;
 };
