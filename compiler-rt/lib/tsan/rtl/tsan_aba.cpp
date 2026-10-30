@@ -16,7 +16,11 @@
 #include "tsan_rtl_aba.h"
 
 #include "tsan_rtl.h"
+#include "tsan_report.h"
+#include "sanitizer_common/sanitizer_stackdepot.h"
+#include "sanitizer_common/sanitizer_symbolizer.h"
 
+extern "C" void __sanitizer_print_stack_trace();
 namespace __tsan {
 
 // Monotonic allocation identity; 0 is reserved for dead/untracked memory.
@@ -97,6 +101,82 @@ static u64 PoolLookup(uptr p) {
   return 0;
 }
 
+atomic_uint64_t g_aba_push_suppressed;
+atomic_uint64_t g_aba_benign[3];
+atomic_uint64_t g_aba_loads, g_aba_loads_tracked, g_aba_cas_checked, g_aba_reports;
+
+void AbaPrintPc(const char *what, uptr pc, uptr cas_pc) {
+  if (!pc) return;
+  SymbolizedStack *s = Symbolizer::GetOrInit()->SymbolizePC(pc);
+  for (SymbolizedStack *f = s; f; f = f->next)
+    Printf("  %s: %s %s:%d\n", what, f->info.function ? f->info.function : "?",
+           f->info.file ? f->info.file : "?", f->info.line);
+  if (s) s->ClearAll();
+  Printf("  CAS stack (TSan shadow stack):\n");
+  ThreadState *thr = cur_thread();
+  VarSizeStackTrace trace;
+  ObtainCurrentStack(thr, cas_pc, &trace);
+  PrintStack(SymbolizeStackId(StackDepotPut(trace)));
+}
+
+void AbaPrintStats() {
+  Printf("ABA stats: ptr-sized loads=%llu tracked=%llu cas-checked=%llu "
+         "reports=%llu suppressed=%llu (mark=%llu push=%llu consistent=%llu)\n",
+         (unsigned long long)atomic_load(&g_aba_loads, memory_order_relaxed),
+         (unsigned long long)atomic_load(&g_aba_loads_tracked, memory_order_relaxed),
+         (unsigned long long)atomic_load(&g_aba_cas_checked, memory_order_relaxed),
+         (unsigned long long)atomic_load(&g_aba_reports, memory_order_relaxed),
+         (unsigned long long)atomic_load(&g_aba_push_suppressed, memory_order_relaxed),
+         (unsigned long long)atomic_load(&g_aba_benign[0], memory_order_relaxed),
+         (unsigned long long)atomic_load(&g_aba_benign[1], memory_order_relaxed),
+         (unsigned long long)atomic_load(&g_aba_benign[2], memory_order_relaxed));
+}
+
+static uptr AbaObjectWords(uptr p) {
+  if (!IsAppMem(p))
+    return 0;
+  if (MBlock *b = ctx->metamap.GetBlock(p))
+    return Min<uptr>(b->siz, 128) / sizeof(uptr);
+  if (atomic_load(&g_pool_used, memory_order_relaxed) && PoolLookup(p))
+    return 1;  // slot size unknown: only the first word is known to be ours
+  return 0;
+}
+
+static bool AbaObjectHolds(uptr obj, uptr value) {
+  uptr words = AbaObjectWords(obj);
+  const uptr *w = (const uptr *)obj;
+  for (uptr i = 0; i < words; i++)
+    if (w[i] == value)
+      return true;
+  return false;
+}
+
+
+
+bool AbaDesiredLinksTo(uptr desired, uptr expected) {
+  // (1) Mark/flag CAS: writes back the same object with different mark bits
+  // (low alignment bits or unused top bits). Old contents are never used.
+  const uptr kAddrBits = 0x00007ffffffffff8ull;
+  if (((desired ^ expected) & kAddrBits) == 0) {
+    atomic_fetch_add(&g_aba_benign[0], 1, memory_order_relaxed);
+    return true;
+  }
+  // (2) Push: the new object already links to the expected one
+  // (n->next == expected). Only the old head's address is used.
+  if (expected && AbaObjectHolds(desired, expected)) {
+    atomic_fetch_add(&g_aba_benign[1], 1, memory_order_relaxed);
+    return true;
+  }
+  // (3) Consistent pop: the object now at `expected` (the new incarnation)
+  // links to `desired`, so the update matches the current structure.
+  // NULL is excluded: any zero word would match it.
+  if (desired && GetPointerEpoch(expected) != 0 && AbaObjectHolds(expected, desired)) {
+    atomic_fetch_add(&g_aba_benign[2], 1, memory_order_relaxed);
+    return true;
+  }
+  return false;
+}
+
 u64 GetPointerEpoch(uptr p) {
   // Every pointer-sized atomic value lands here, including integers and
   // tagged pointers. GetBlock computes a meta address from p without a range
@@ -128,3 +208,8 @@ void __tsan_aba_pool_free(void *addr) { PoolRemove((uptr)addr); }
 SANITIZER_INTERFACE_ATTRIBUTE
 unsigned long long __tsan_aba_report_count(void) { return aba_report_count; }
 }  // extern "C"
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+unsigned long long __tsan_aba_push_suppressed_count(void) {
+  return atomic_load(&g_aba_push_suppressed, memory_order_relaxed);
+}

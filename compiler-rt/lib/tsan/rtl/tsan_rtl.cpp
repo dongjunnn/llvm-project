@@ -12,6 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "tsan_rtl.h"
+#include "tsan_rtl_aba.h"
 
 #include "sanitizer_common/sanitizer_atomic.h"
 #include "sanitizer_common/sanitizer_common.h"
@@ -798,6 +799,10 @@ void MaybeSpawnBackgroundThread() {
 }
 
 int Finalize(ThreadState *thr) {
+#if !SANITIZER_GO
+  if (Verbosity() || GetEnv("TSAN_ABA_STATS"))
+    AbaPrintStats();
+#endif
   bool failed = false;
 
 #if !SANITIZER_GO
