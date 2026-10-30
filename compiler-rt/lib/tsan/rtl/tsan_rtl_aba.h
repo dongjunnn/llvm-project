@@ -25,8 +25,8 @@ namespace __tsan {
 #if SANITIZER_GO
 
 // Go has its own allocator and no annotation API; the detector is C/C++ only.
-static inline void AbaRecordLoad(uptr addr, uptr value) {}
-static inline void AbaCheckCas(uptr addr, uptr expected) {}
+static inline void AbaRecordLoad(uptr addr, uptr value, uptr pc = 0) {}
+static inline void AbaCheckCas(uptr addr, uptr expected, uptr desired, uptr pc = 0) {}
 
 #else
 
@@ -37,6 +37,16 @@ extern atomic_uint64_t g_aba_epoch;
 // Resolves heap blocks first, then annotated pool slots.
 u64 GetPointerEpoch(uptr p);
 
+// EXPERIMENT: true if the object at `desired` holds the pointer `expected` in
+// one of its words -- the signature of a push-style CAS (n->next == expected),
+// which only uses the old object's address and so tolerates ABA.
+bool AbaDesiredLinksTo(uptr desired, uptr expected);
+void AbaPrintPc(const char *what, uptr pc, uptr cas_pc);
+extern atomic_uint64_t g_aba_push_suppressed;
+// EXPERIMENT: coverage counters, printed at exit with TSAN_OPTIONS=verbosity=1
+extern atomic_uint64_t g_aba_loads, g_aba_loads_tracked, g_aba_cas_checked, g_aba_reports;
+void AbaPrintStats();
+
 // Per-thread cache: 16 sets x 4 ways, keyed by the atomic variable's address.
 static const uptr kAbaSets = 16;
 static const uptr kAbaWays = 4;
@@ -46,6 +56,7 @@ struct AbaEntry {
   uptr loaded_ptr;  // pointer value observed at load
   u64  epoch;       // its alloc epoch at load time
   u32  lru;         // last-touch tick, for eviction
+  uptr pc;          // EXPERIMENT: caller pc of the recording op
 };
 
 struct AbaCache {
@@ -67,10 +78,12 @@ static inline uptr AbaSetIndex(uptr addr) {
 }
 
 // Record a loaded pointer's epoch. Untracked values (epoch 0) are ignored.
-static inline void AbaRecordLoad(uptr addr, uptr value) {
+static inline void AbaRecordLoad(uptr addr, uptr value, uptr pc = 0) {
+  atomic_fetch_add(&g_aba_loads, 1, memory_order_relaxed);
   u64 epoch = GetPointerEpoch(value);
   if (epoch == 0)
     return;
+  atomic_fetch_add(&g_aba_loads_tracked, 1, memory_order_relaxed);
   AbaEntry *set = aba_cache.sets[AbaSetIndex(addr)];
   AbaEntry *slot = &set[0];
   for (uptr i = 0; i < kAbaWays; i++) {
@@ -85,10 +98,11 @@ static inline void AbaRecordLoad(uptr addr, uptr value) {
   slot->loaded_ptr = value;
   slot->epoch = epoch;
   slot->lru = ++aba_cache.tick;
+  slot->pc = pc;
 }
 
 // On a successful CAS, fire if expected's epoch changed since the load.
-static inline void AbaCheckCas(uptr addr, uptr expected) {
+static inline void AbaCheckCas(uptr addr, uptr expected, uptr desired, uptr pc = 0) {
   AbaEntry *set = aba_cache.sets[AbaSetIndex(addr)];
   AbaEntry *e = nullptr;
   for (uptr i = 0; i < kAbaWays; i++) {
@@ -99,7 +113,13 @@ static inline void AbaCheckCas(uptr addr, uptr expected) {
   }
   if (!e || e->loaded_ptr != expected)
     return;
+  atomic_fetch_add(&g_aba_cas_checked, 1, memory_order_relaxed);
   u64 now = GetPointerEpoch(expected);
+  if (now != e->epoch && AbaDesiredLinksTo(desired, expected)) {
+    atomic_fetch_add(&g_aba_push_suppressed, 1, memory_order_relaxed);
+    e->addr = 0;
+    return;
+  }
   if (now != e->epoch) {
     Printf(
         "==================\n"
@@ -112,7 +132,11 @@ static inline void AbaCheckCas(uptr addr, uptr expected) {
         "==================\n",
         (void *)expected, (void *)addr, (unsigned long long)e->epoch,
         (unsigned long long)now);
+    Printf("  desired=%p  expected-word0-now=%p  tid=%d\n", (void *)desired,
+           now ? *(void **)expected : nullptr, (int)GetTid());
+    AbaPrintPc("note recorded at", e->pc, pc);
     aba_report_count++;
+    atomic_fetch_add(&g_aba_reports, 1, memory_order_relaxed);
     e->addr = 0;  // consume; don't re-report this slot
   }
 }
