@@ -226,11 +226,27 @@ static memory_order to_mo(morder mo) {
 
 namespace {
 
+// ABA: an exchange tells the thread what the atomic now holds (like a store);
+// a pointer-sized fetch-op changes it in a way we don't model, so drop the note.
+template <typename T, T (*F)(volatile T *v, T op)>
+static inline void AbaAfterRmw(volatile T *a, T v, uptr pc) {
+  if (sizeof(T) != sizeof(uptr))
+    return;
+  if (F == &func_xchg<T>)
+    AbaRecordLoad((uptr)a, (uptr)v, pc);
+  else
+    AbaForget((uptr)a);
+}
+
 template <typename T, T (*F)(volatile T *v, T op)>
 static T AtomicRMW(ThreadState *thr, uptr pc, volatile T *a, T v, morder mo) {
   MemoryAccess(thr, pc, (uptr)a, AccessSize<T>(), kAccessWrite | kAccessAtomic);
-  if (LIKELY(mo == mo_relaxed))
-    return F(a, v);
+  if (LIKELY(mo == mo_relaxed)) {
+    T old = F(a, v);
+    AbaAfterRmw<T, F>(a, v, pc);
+    return old;
+  }
+  T arg = v;
   SlotLocker locker(thr);
   {
     auto s = ctx->metamap.GetSyncOrCreate(thr, pc, (uptr)a, false);
@@ -243,6 +259,7 @@ static T AtomicRMW(ThreadState *thr, uptr pc, volatile T *a, T v, morder mo) {
       thr->clock.Acquire(s->clock);
     v = F(a, v);
   }
+  AbaAfterRmw<T, F>(a, arg, pc);
   if (IsReleaseOrder(mo))
     IncrementEpoch(thr);
   return v;
