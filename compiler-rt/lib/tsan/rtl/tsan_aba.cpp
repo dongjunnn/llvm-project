@@ -112,6 +112,7 @@ static u64 PoolLookup(uptr p) {
 
 atomic_uint64_t g_aba_push_suppressed;
 atomic_uint64_t g_aba_benign[3];
+
 atomic_uint64_t g_aba_loads, g_aba_loads_tracked, g_aba_cas_checked, g_aba_reports;
 
 void AbaPrintPc(const char *what, uptr pc, uptr cas_pc) {
@@ -141,11 +142,30 @@ void AbaPrintStats() {
          (unsigned long long)atomic_load(&g_aba_benign[2], memory_order_relaxed));
 }
 
+// Heap block containing p (p may point up to 128 bytes past the block start,
+// e.g. past an allocator header or into an intrusive link field).
+static MBlock *AbaEnclosingBlock(uptr p, uptr *start) {
+  if (p < HeapMemBeg() || p >= HeapMemEnd())
+    return nullptr;
+  for (uptr back = 0; back <= 128; back += kMetaShadowCell) {
+    uptr q = RoundDownTo(p, kMetaShadowCell) - back;
+    if (MBlock *b = ctx->metamap.GetBlock(q)) {
+      if (q + b->siz > p) {
+        *start = q;
+        return b;
+      }
+      return nullptr;  // p lies past the end of the nearest block
+    }
+  }
+  return nullptr;
+}
+
 static uptr AbaObjectWords(uptr p) {
   if (!IsAppMem(p))
     return 0;
-  if (MBlock *b = ctx->metamap.GetBlock(p))
-    return Min<uptr>(b->siz, 128) / sizeof(uptr);
+  uptr start;
+  if (MBlock *b = AbaEnclosingBlock(p, &start))
+    return Min<uptr>(start + b->siz - p, 128) / sizeof(uptr);
   if (atomic_load(&g_pool_used, memory_order_relaxed) && PoolLookup(p))
     return 1;  // slot size unknown: only the first word is known to be ours
   return 0;
@@ -162,6 +182,34 @@ static bool AbaObjectHolds(uptr obj, uptr value) {
 
 
 
+// Multi-node push: desired is the first node of a private chain whose last
+// node links to expected (first->...->last->next == expected). Follow each
+// pointer-valued word offset of desired along the chain.
+static bool AbaChainReaches(uptr desired, uptr expected) {
+  uptr words = AbaObjectWords(desired);
+  for (uptr off = 0; off < words; off++) {
+    uptr cur = ((const uptr *)desired)[off];
+    for (int hop = 0; hop < 4096 && cur; hop++) {
+      if (cur == expected)
+        return true;
+      if (AbaObjectWords(cur) <= off || GetPointerEpoch(cur) == 0)
+        break;
+      cur = ((const uptr *)cur)[off];
+    }
+  }
+  return false;
+}
+
+void AbaDebugObject(const char *what, uptr p) {
+  uptr words = AbaObjectWords(p);
+  Printf("  %s %p: words=%zu epoch=%llu heapblock=%d", what, (void *)p, words,
+         (unsigned long long)GetPointerEpoch(p),
+         IsAppMem(p) && ctx->metamap.GetBlock(p) ? 1 : 0);
+  for (uptr i = 0; i < words && i < 4; i++)
+    Printf(" [%zu]=%p", i, ((void **)p)[i]);
+  Printf("\n");
+}
+
 bool AbaDesiredLinksTo(uptr desired, uptr expected) {
   // (1) Mark/flag CAS: writes back the same object with different mark bits
   // (low alignment bits or unused top bits). Old contents are never used.
@@ -172,7 +220,8 @@ bool AbaDesiredLinksTo(uptr desired, uptr expected) {
   }
   // (2) Push: the new object already links to the expected one
   // (n->next == expected). Only the old head's address is used.
-  if (expected && AbaObjectHolds(desired, expected)) {
+  if (expected && (AbaObjectHolds(desired, expected) ||
+                   AbaChainReaches(desired, expected))) {
     atomic_fetch_add(&g_aba_benign[1], 1, memory_order_relaxed);
     return true;
   }
@@ -198,6 +247,11 @@ u64 GetPointerEpoch(uptr p) {
     if (u64 e = PoolLookup(p))
       return e;
   if (MBlock *b = ctx->metamap.GetBlock(p))
+    return b->alloc_epoch;
+  // Interior pointer (intrusive link field, allocator header): use the
+  // enclosing block's identity.
+  uptr start;
+  if (MBlock *b = AbaEnclosingBlock(p, &start))
     return b->alloc_epoch;
   return 0;
 }
