@@ -271,7 +271,7 @@ struct OpLoad {
                    kAccessRead | kAccessAtomic);
       T v = NoTsanAtomic(mo, a);
       if (sizeof(T) == sizeof(uptr))  // ABA: only pointer-sized atomics
-        AbaRecordLoad((uptr)a, (uptr)v);
+        AbaRecordLoad((uptr)a, (uptr)v, pc);
       return v;
     }
     // Don't create sync object if it does not exist yet. For example, an atomic
@@ -289,7 +289,7 @@ struct OpLoad {
     MemoryAccess(thr, pc, (uptr)a, AccessSize<T>(),
                  kAccessRead | kAccessAtomic);
     if (sizeof(T) == sizeof(uptr))  // ABA: only pointer-sized atomics
-      AbaRecordLoad((uptr)a, (uptr)v);
+      AbaRecordLoad((uptr)a, (uptr)v, pc);
     return v;
   }
 };
@@ -313,7 +313,7 @@ struct OpStore {
     MemoryAccess(thr, pc, (uptr)a, AccessSize<T>(),
                  kAccessWrite | kAccessAtomic);
     if (sizeof(T) == sizeof(uptr))  // ABA: the storer now knows a holds v
-      AbaRecordLoad((uptr)a, (uptr)v);
+      AbaRecordLoad((uptr)a, (uptr)v, pc);
     // This fast-path is critical for performance.
     // Assume the access is atomic.
     // Strictly saying even relaxed store cuts off release sequence,
@@ -455,14 +455,14 @@ struct OpCAS {
       T pr = func_cas(a, cc, v);
       if (pr == cc) {
         if (sizeof(T) == sizeof(uptr)) {  // ABA: only pointer-sized atomics
-          AbaCheckCas((uptr)a, (uptr)cc);
-          AbaRecordLoad((uptr)a, (uptr)v);  // the CAS stored v
+          AbaCheckCas((uptr)a, (uptr)cc, (uptr)v, pc);
+          AbaRecordLoad((uptr)a, (uptr)v, pc);  // the CAS stored v
         }
         return true;
       }
       *c = pr;
       if (sizeof(T) == sizeof(uptr))  // ABA: a failed CAS is a load of pr
-        AbaRecordLoad((uptr)a, (uptr)pr);
+        AbaRecordLoad((uptr)a, (uptr)pr, pc);
       return false;
     }
     SlotLocker locker(thr);
@@ -478,11 +478,11 @@ struct OpCAS {
         *c = pr;
         mo = fmo;
         if (sizeof(T) == sizeof(uptr))  // ABA: a failed CAS is a load of pr
-          AbaRecordLoad((uptr)a, (uptr)pr);
+          AbaRecordLoad((uptr)a, (uptr)pr, pc);
       }
       if (success && sizeof(T) == sizeof(uptr)) {  // ABA: only pointer-sized atomics
-        AbaCheckCas((uptr)a, (uptr)cc);
-        AbaRecordLoad((uptr)a, (uptr)v);  // the CAS stored v
+        AbaCheckCas((uptr)a, (uptr)cc, (uptr)v, pc);
+        AbaRecordLoad((uptr)a, (uptr)v, pc);  // the CAS stored v
       }
       if (success && IsAcqRelOrder(mo))
         thr->clock.ReleaseAcquire(&s->clock);
