@@ -43,6 +43,7 @@ u64 GetPointerEpoch(uptr p);
 // which only uses the old object's address and so tolerates ABA.
 bool AbaDesiredLinksTo(uptr desired, uptr expected);
 void AbaPrintPc(const char *what, uptr pc, uptr cas_pc);
+void AbaDebugObject(const char *what, uptr p);
 extern atomic_uint64_t g_aba_push_suppressed;
 // EXPERIMENT: coverage counters, printed at exit with TSAN_OPTIONS=verbosity=1
 extern atomic_uint64_t g_aba_loads, g_aba_loads_tracked, g_aba_cas_checked, g_aba_reports;
@@ -152,6 +153,8 @@ static inline void AbaCheckCas(uptr addr, uptr expected, uptr desired, uptr pc =
         (unsigned long long)now);
     Printf("  desired=%p  expected-word0-now=%p  tid=%d\n", (void *)desired,
            now ? *(void **)expected : nullptr, (int)GetTid());
+    AbaDebugObject("desired", desired);
+    AbaDebugObject("expected", expected);
     AbaPrintPc("note recorded at", e->pc, pc);
     aba_report_count++;
     atomic_fetch_add(&g_aba_reports, 1, memory_order_relaxed);
