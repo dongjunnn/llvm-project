@@ -26,6 +26,7 @@ namespace __tsan {
 
 // Go has its own allocator and no annotation API; the detector is C/C++ only.
 static inline void AbaRecordLoad(uptr addr, uptr value, uptr pc = 0) {}
+static inline void AbaForget(uptr addr) {}
 static inline void AbaCheckCas(uptr addr, uptr expected, uptr desired, uptr pc = 0) {}
 
 #else
@@ -74,15 +75,24 @@ __attribute__((tls_model("initial-exec")))
 extern THREADLOCAL u64 aba_report_count;
 
 static inline uptr AbaSetIndex(uptr addr) {
-  return (addr >> 3) & (kAbaSets - 1);  // atomics are >= pointer-aligned
+  // Multiplicative hash: (addr >> 3) & 15 put cache-line-aligned nodes into
+  // only 2 of the 16 sets.
+  return (uptr)(((u64)addr * 0x9E3779B97F4A7C15ull) >> 60) & (kAbaSets - 1);
 }
 
 // Record a loaded pointer's epoch. Untracked values (epoch 0) are ignored.
 static inline void AbaRecordLoad(uptr addr, uptr value, uptr pc = 0) {
   atomic_fetch_add(&g_aba_loads, 1, memory_order_relaxed);
   u64 epoch = GetPointerEpoch(value);
-  if (epoch == 0)
+  if (epoch == 0) {
+    // The thread now knows the atomic holds an untracked value: an older note
+    // for it is stale and must not be checked against a later CAS.
+    AbaEntry *set = aba_cache.sets[AbaSetIndex(addr)];
+    for (uptr i = 0; i < kAbaWays; i++)
+      if (set[i].addr == addr)
+        set[i].addr = 0;
     return;
+  }
   atomic_fetch_add(&g_aba_loads_tracked, 1, memory_order_relaxed);
   AbaEntry *set = aba_cache.sets[AbaSetIndex(addr)];
   AbaEntry *slot = &set[0];
@@ -99,6 +109,14 @@ static inline void AbaRecordLoad(uptr addr, uptr value, uptr pc = 0) {
   slot->epoch = epoch;
   slot->lru = ++aba_cache.tick;
   slot->pc = pc;
+}
+
+// The atomic was changed in a way we don't model (fetch-op): drop the note.
+static inline void AbaForget(uptr addr) {
+  AbaEntry *set = aba_cache.sets[AbaSetIndex(addr)];
+  for (uptr i = 0; i < kAbaWays; i++)
+    if (set[i].addr == addr)
+      set[i].addr = 0;
 }
 
 // On a successful CAS, fire if expected's epoch changed since the load.

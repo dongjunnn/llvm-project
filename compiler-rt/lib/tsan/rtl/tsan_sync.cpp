@@ -12,6 +12,7 @@
 #include "sanitizer_common/sanitizer_placement_new.h"
 #include "tsan_sync.h"
 #include "tsan_rtl.h"
+#include "tsan_rtl_aba.h"
 #include "tsan_mman.h"
 
 namespace __tsan {
@@ -51,6 +52,14 @@ void MetaMap::AllocBlock(ThreadState *thr, uptr pc, uptr p, uptr sz) {
   b->tag = 0;
   b->tid = thr->tid;
   b->stk = CurrentStackId(thr, pc);
+#if !SANITIZER_GO
+  // ABA: stamp before the block becomes visible through the meta map, so a
+  // concurrent lookup never sees a recycled MBlock's stale epoch.
+  b->alloc_epoch =
+      atomic_fetch_add(&g_aba_epoch, 1, memory_order_relaxed) % 8191 + 1;
+#else
+  b->alloc_epoch = 0;
+#endif
   u32 *meta = MemToMeta(p);
   DCHECK_EQ(*meta, 0);
   *meta = idx | kFlagBlock;
