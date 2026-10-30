@@ -279,11 +279,6 @@ void OnUserAlloc(ThreadState *thr, uptr pc, uptr p, uptr sz, bool write) {
   // which iterates over and resets all sync objects,
   // but it is fine to create new MBlocks in this context.
   ctx->metamap.AllocBlock(thr, pc, p, sz);
-  if (MBlock *b = ctx->metamap.GetBlock(p)) {
-    // Cycle through 1..255; 0 means "dead/untracked" and must never be stamped.
-    u64 e = atomic_fetch_add(&g_aba_epoch, 1, memory_order_relaxed);
-    b->alloc_epoch = e % 255 + 1;
-  }
   // If this runs before thread initialization/after finalization
   // and we don't have trace initialized, we can't imitate writes.
   // In such case just reset the shadow range, it is fine since

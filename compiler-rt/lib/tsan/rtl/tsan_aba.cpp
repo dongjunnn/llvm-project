@@ -62,6 +62,15 @@ static inline uptr PoolHash(uptr p) {
 
 static void PoolInsert(uptr p, u64 epoch) {
   uptr h = PoolHash(p);
+  // Re-stamp an existing entry for p first; claiming an earlier hole would
+  // leave a stale duplicate that resurfaces after the next remove.
+  for (uptr i = 0; i < kPoolProbe; i++) {
+    PoolSlot *s = &g_pool_map[(h + i) & kPoolMask];
+    if (atomic_load(&s->addr, memory_order_acquire) == p) {
+      atomic_store(&s->epoch, epoch, memory_order_release);
+      return;
+    }
+  }
   for (uptr i = 0; i < kPoolProbe; i++) {
     PoolSlot *s = &g_pool_map[(h + i) & kPoolMask];
     uptr cur = atomic_load(&s->addr, memory_order_acquire);
@@ -183,11 +192,14 @@ u64 GetPointerEpoch(uptr p) {
   // check, so a value outside application memory would fault.
   if (!IsAppMem(p))
     return 0;
+  // Annotated slots first: a slot at the start of a malloc'd slab shares its
+  // address with the slab's own heap block.
+  if (atomic_load(&g_pool_used, memory_order_relaxed))
+    if (u64 e = PoolLookup(p))
+      return e;
   if (MBlock *b = ctx->metamap.GetBlock(p))
     return b->alloc_epoch;
-  if (atomic_load(&g_pool_used, memory_order_relaxed) == 0)
-    return 0;
-  return PoolLookup(p);
+  return 0;
 }
 
 }  // namespace __tsan
