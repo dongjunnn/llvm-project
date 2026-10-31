@@ -111,6 +111,12 @@ static u64 PoolLookup(uptr p) {
 }
 
 atomic_uint64_t g_aba_push_suppressed;
+atomic_uint64_t g_aba_freed_suppressed;
+bool AbaReportFreed() {
+  static int v = -1;
+  if (v < 0) v = GetEnv("TSAN_ABA_REPORT_FREED") ? 1 : 0;
+  return v;
+}
 atomic_uint64_t g_aba_benign[3];
 
 atomic_uint64_t g_aba_loads, g_aba_loads_tracked, g_aba_cas_checked, g_aba_reports;
@@ -131,7 +137,7 @@ void AbaPrintPc(const char *what, uptr pc, uptr cas_pc) {
 
 void AbaPrintStats() {
   Printf("ABA stats: ptr-sized loads=%llu tracked=%llu cas-checked=%llu "
-         "reports=%llu suppressed=%llu (mark=%llu push=%llu consistent=%llu)\n",
+         "reports=%llu suppressed=%llu (mark=%llu push=%llu consistent=%llu) freed-token=%llu\n",
          (unsigned long long)atomic_load(&g_aba_loads, memory_order_relaxed),
          (unsigned long long)atomic_load(&g_aba_loads_tracked, memory_order_relaxed),
          (unsigned long long)atomic_load(&g_aba_cas_checked, memory_order_relaxed),
@@ -139,7 +145,8 @@ void AbaPrintStats() {
          (unsigned long long)atomic_load(&g_aba_push_suppressed, memory_order_relaxed),
          (unsigned long long)atomic_load(&g_aba_benign[0], memory_order_relaxed),
          (unsigned long long)atomic_load(&g_aba_benign[1], memory_order_relaxed),
-         (unsigned long long)atomic_load(&g_aba_benign[2], memory_order_relaxed));
+         (unsigned long long)atomic_load(&g_aba_benign[2], memory_order_relaxed),
+         (unsigned long long)atomic_load(&g_aba_freed_suppressed, memory_order_relaxed));
 }
 
 // Heap block containing p (p may point up to 128 bytes past the block start,
