@@ -45,6 +45,10 @@ bool AbaDesiredLinksTo(uptr desired, uptr expected);
 void AbaPrintPc(const char *what, uptr pc, uptr cas_pc);
 void AbaDebugObject(const char *what, uptr p);
 extern atomic_uint64_t g_aba_push_suppressed;
+// EXPERIMENT: CASes whose expected object is not allocated at CAS time
+// (a dangling token, e.g. an exchange emulated with a CAS loop).
+extern atomic_uint64_t g_aba_freed_suppressed;
+bool AbaReportFreed();
 // EXPERIMENT: coverage counters, printed at exit with TSAN_OPTIONS=verbosity=1
 extern atomic_uint64_t g_aba_loads, g_aba_loads_tracked, g_aba_cas_checked, g_aba_reports;
 void AbaPrintStats();
@@ -139,17 +143,27 @@ static inline void AbaCheckCas(uptr addr, uptr expected, uptr desired, uptr pc =
     e->addr = 0;
     return;
   }
+  if (now != e->epoch && now == 0 && !AbaReportFreed()) {
+    // The location holds the address of a block that is not allocated now:
+    // nothing came back as "A", the value is only a stale token (hazard slot,
+    // exchange emulated with a CAS loop). Not identity reuse.
+    atomic_fetch_add(&g_aba_freed_suppressed, 1, memory_order_relaxed);
+    e->addr = 0;
+    return;
+  }
   if (now != e->epoch) {
     Printf(
         "==================\n"
         "WARNING: ThreadSanitizer: ABA detected (heap object identity "
         "change)\n"
-        "  Confidence: HIGH -- object at %p was freed and reallocated\n"
+        "  Confidence: %s -- object at %p %s\n"
         "  Atomic variable at:        %p\n"
         "  Allocation epoch at load:  %llu\n"
         "  Allocation epoch at CAS:   %llu\n"
         "==================\n",
-        (void *)expected, (void *)addr, (unsigned long long)e->epoch,
+        now ? "HIGH" : "LOW", (void *)expected,
+        now ? "was freed and reallocated" : "is freed (dangling value)",
+        (void *)addr, (unsigned long long)e->epoch,
         (unsigned long long)now);
     Printf("  desired=%p  expected-word0-now=%p  tid=%d\n", (void *)desired,
            now ? *(void **)expected : nullptr, (int)GetTid());
