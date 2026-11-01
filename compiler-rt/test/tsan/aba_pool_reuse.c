@@ -40,7 +40,9 @@ int main(void) {
   sem_post(&to_t2);
   sem_wait(&to_t1);              // T2 recycles the slot
 
-  atomic_compare_exchange_strong(&ptr, &expected, slot);
+  // desired must differ from expected: a slot->slot CAS is a no-op that the
+  // mark filter (same address bits) correctly treats as harmless.
+  atomic_compare_exchange_strong(&ptr, &expected, (int *)0);
   pthread_join(th, NULL);
   return 0;
 }
