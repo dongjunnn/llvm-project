@@ -1,12 +1,13 @@
 // RUN: %clang_tsan -O1 -DOFFSET=0 %s -o %t-control && %run %t-control 2>&1 | FileCheck %s --check-prefix=CONTROL
-// RUN: %clang_tsan -O1 -DOFFSET=16 %s -o %t-limit && %run %t-limit 2>&1 | FileCheck %s --check-prefix=LIMIT
+// RUN: %clang_tsan -O1 -DOFFSET=16 %s -o %t-interior && %run %t-interior 2>&1 | FileCheck %s --check-prefix=CONTROL
+// RUN: %clang_tsan -O1 -DOFFSET=200 -DBLOCK=256 %s -o %t-far && %run %t-far 2>&1 | FileCheck %s --check-prefix=LIMIT
 //
-// LIMITATION (documents current behaviour; flip the limit run when fixed).
-// The atomic holds a pointer into the middle of a heap block, as intrusive
-// lists do when the link field is not the first member. The epoch lookup only
-// finds a block from its first 8-byte cell, so the interior pointer is
-// untracked and a real heap-reuse ABA is missed.
-// The control run (OFFSET=0) points at the start of the block and must report.
+// Interior pointers. The atomic holds a pointer into the middle of a heap
+// block, as intrusive lists do when the link field is not the first member.
+// The epoch lookup resolves pointers up to 128 bytes past the block start to
+// the enclosing block, so OFFSET=0 and OFFSET=16 must both report.
+// LIMITATION (still documented): links more than 128 bytes into the block
+// (OFFSET=200) are not resolved and the ABA is missed.
 #include <assert.h>
 #include <pthread.h>
 #include <semaphore.h>
@@ -14,7 +15,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#ifndef BLOCK
 #define BLOCK 64
+#endif
 
 static _Atomic(char *) ptr;
 static sem_t to_t2, to_t1;
