@@ -249,7 +249,13 @@ void AbaDebugObject(const char *what, uptr p) {
   Printf("\n");
 }
 
-bool AbaDesiredLinksTo(uptr desired, uptr expected) {
+void AbaSnapshot(uptr value, uptr *snap) {
+  uptr words = Min<uptr>(AbaObjectWords(value), kAbaSnapWords);
+  for (uptr i = 0; i < kAbaSnapWords; i++)
+    snap[i] = i < words ? ((const uptr *)value)[i] : 0;
+}
+
+bool AbaDesiredLinksTo(uptr desired, uptr expected, bool pop_like) {
   // (1) Mark/flag CAS: writes back the same object with different mark bits
   // (low alignment bits or unused top bits). Old contents are never used.
   const uptr kAddrBits = 0x00007ffffffffff8ull;
@@ -259,7 +265,7 @@ bool AbaDesiredLinksTo(uptr desired, uptr expected) {
   }
   // (2) Push: the new object already links to the expected one
   // (n->next == expected). Only the old head's address is used.
-  if (expected && (AbaObjectHolds(desired, expected) ||
+  if (expected && !pop_like && (AbaObjectHolds(desired, expected) ||
                    AbaChainReaches(desired, expected))) {
     atomic_fetch_add(&g_aba_benign[1], 1, memory_order_relaxed);
     return true;
