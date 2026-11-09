@@ -137,7 +137,8 @@ void AbaPrintPc(const char *what, uptr pc, uptr cas_pc) {
 
 void AbaPrintStats() {
   Printf("ABA stats: ptr-sized loads=%llu tracked=%llu cas-checked=%llu "
-         "reports=%llu suppressed=%llu (mark=%llu push=%llu consistent=%llu) freed-token=%llu\n",
+         "reports=%llu suppressed=%llu (mark=%llu push=%llu consistent=%llu) freed-token=%llu "
+         "loc-checked=%llu loc-reports=%llu\n",
          (unsigned long long)atomic_load(&g_aba_loads, memory_order_relaxed),
          (unsigned long long)atomic_load(&g_aba_loads_tracked, memory_order_relaxed),
          (unsigned long long)atomic_load(&g_aba_cas_checked, memory_order_relaxed),
@@ -146,7 +147,9 @@ void AbaPrintStats() {
          (unsigned long long)atomic_load(&g_aba_benign[0], memory_order_relaxed),
          (unsigned long long)atomic_load(&g_aba_benign[1], memory_order_relaxed),
          (unsigned long long)atomic_load(&g_aba_benign[2], memory_order_relaxed),
-         (unsigned long long)atomic_load(&g_aba_freed_suppressed, memory_order_relaxed));
+         (unsigned long long)atomic_load(&g_aba_freed_suppressed, memory_order_relaxed),
+         (unsigned long long)atomic_load(&g_aba_loc_checked, memory_order_relaxed),
+         (unsigned long long)atomic_load(&g_aba_loc_reports, memory_order_relaxed));
 }
 
 // Heap block containing p (p may point up to 128 bytes past the block start,
@@ -261,6 +264,55 @@ u64 GetPointerEpoch(uptr p) {
   if (MBlock *b = AbaEnclosingBlock(p, &start))
     return b->alloc_epoch;
   return 0;
+}
+
+atomic_uint64_t g_aba_loc_checked, g_aba_loc_reports;
+
+bool AbaLocationEnabled() {
+  static int v = -1;
+  if (v < 0) {
+    const char *e = GetEnv("TSAN_ABA_LOCATION");
+    v = (e && e[0] == '0') ? 0 : 1;  // on by default
+  }
+  return v;
+}
+
+u64 AbaLocationEpoch(uptr addr) {
+  if (!IsAppMem(addr))
+    return 0;
+  // An annotated slot whose first word is the atomic (intrusive next link).
+  if (atomic_load(&g_pool_used, memory_order_relaxed))
+    if (u64 e = PoolLookup(addr))
+      return e;
+  // Globals and stacks have no identity; skip the meta-map walk for them.
+  if (addr < HeapMemBeg() || addr >= HeapMemEnd())
+    return 0;
+  if (MBlock *b = ctx->metamap.GetBlock(addr))
+    return b->alloc_epoch;
+  uptr start;
+  if (MBlock *b = AbaEnclosingBlock(addr, &start))
+    return b->alloc_epoch;
+  return 0;
+}
+
+void AbaReportLocation(uptr addr, uptr expected, uptr desired, u64 then,
+                       u64 now, uptr load_pc, uptr cas_pc) {
+  Printf(
+      "==================\n"
+      "WARNING: ThreadSanitizer: ABA detected (location identity change)\n"
+      "  Confidence: HIGH -- the object holding the atomic was recycled "
+      "between the load and the CAS\n"
+      "  Atomic variable at:        %p\n"
+      "  Holder epoch at load:      %llu\n"
+      "  Holder epoch at CAS:       %llu\n"
+      "  expected=%p desired=%p tid=%d\n"
+      "==================\n",
+      (void *)addr, (unsigned long long)then, (unsigned long long)now,
+      (void *)expected, (void *)desired, (int)GetTid());
+  AbaPrintPc("note recorded at", load_pc, cas_pc);
+  aba_report_count++;
+  atomic_fetch_add(&g_aba_reports, 1, memory_order_relaxed);
+  atomic_fetch_add(&g_aba_loc_reports, 1, memory_order_relaxed);
 }
 
 }  // namespace __tsan

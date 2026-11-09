@@ -38,6 +38,18 @@ extern atomic_uint64_t g_aba_epoch;
 // Resolves heap blocks first, then annotated pool slots.
 u64 GetPointerEpoch(uptr p);
 
+// EXPERIMENT (location ABA): identity of the heap block or annotated pool slot
+// that holds the atomic variable at addr, or 0 for globals, stacks, untracked
+// memory. A CAS on a field of an object that was recycled after the load is
+// ABA on the location itself (Michael-Scott enqueue: CAS(&tail->next, END, n)
+// on a tail node that was popped and re-linked elsewhere), even when the value
+// compared is a NULL/end token the value check cannot track.
+u64 AbaLocationEpoch(uptr addr);
+bool AbaLocationEnabled();
+extern atomic_uint64_t g_aba_loc_checked, g_aba_loc_reports;
+void AbaReportLocation(uptr addr, uptr expected, uptr desired, u64 then, u64 now,
+                       uptr load_pc, uptr cas_pc);
+
 // EXPERIMENT: true if the object at `desired` holds the pointer `expected` in
 // one of its words -- the signature of a push-style CAS (n->next == expected),
 // which only uses the old object's address and so tolerates ABA.
@@ -60,7 +72,8 @@ static const uptr kAbaWays = 4;
 struct AbaEntry {
   uptr addr;        // atomic variable address (key); 0 == empty
   uptr loaded_ptr;  // pointer value observed at load
-  u64  epoch;       // its alloc epoch at load time
+  u64  epoch;       // its alloc epoch at load time (0: value untracked)
+  u64  loc_epoch;   // identity of the object holding the atomic (0: none)
   u32  lru;         // last-touch tick, for eviction
   uptr pc;          // EXPERIMENT: caller pc of the recording op
 };
@@ -85,11 +98,13 @@ static inline uptr AbaSetIndex(uptr addr) {
   return (uptr)(((u64)addr * 0x9E3779B97F4A7C15ull) >> 60) & (kAbaSets - 1);
 }
 
-// Record a loaded pointer's epoch. Untracked values (epoch 0) are ignored.
+// Record a loaded pointer's epoch and the identity of the atomic's holder.
+// Notes with neither (untracked value in untracked memory) are dropped.
 static inline void AbaRecordLoad(uptr addr, uptr value, uptr pc = 0) {
   atomic_fetch_add(&g_aba_loads, 1, memory_order_relaxed);
   u64 epoch = GetPointerEpoch(value);
-  if (epoch == 0) {
+  u64 loc = AbaLocationEnabled() ? AbaLocationEpoch(addr) : 0;
+  if (epoch == 0 && loc == 0) {
     // The thread now knows the atomic holds an untracked value: an older note
     // for it is stale and must not be checked against a later CAS.
     AbaEntry *set = aba_cache.sets[AbaSetIndex(addr)];
@@ -112,6 +127,7 @@ static inline void AbaRecordLoad(uptr addr, uptr value, uptr pc = 0) {
   slot->addr = addr;
   slot->loaded_ptr = value;
   slot->epoch = epoch;
+  slot->loc_epoch = loc;
   slot->lru = ++aba_cache.tick;
   slot->pc = pc;
 }
@@ -136,6 +152,19 @@ static inline void AbaCheckCas(uptr addr, uptr expected, uptr desired, uptr pc =
   }
   if (!e || e->loaded_ptr != expected)
     return;
+  if (e->loc_epoch) {
+    atomic_fetch_add(&g_aba_loc_checked, 1, memory_order_relaxed);
+    u64 loc_now = AbaLocationEpoch(addr);
+    // loc_now == 0: the holder was freed -- a use-after-free, not ours to
+    // report (ASan's job), and too easily a benign teardown race.
+    if (loc_now != 0 && loc_now != e->loc_epoch) {
+      AbaReportLocation(addr, expected, desired, e->loc_epoch, loc_now, e->pc, pc);
+      e->addr = 0;
+      return;
+    }
+  }
+  if (e->epoch == 0)
+    return;  // value untracked: only the location could be checked
   atomic_fetch_add(&g_aba_cas_checked, 1, memory_order_relaxed);
   u64 now = GetPointerEpoch(expected);
   if (now != e->epoch && AbaDesiredLinksTo(desired, expected)) {
