@@ -397,6 +397,15 @@ static const void *user_alloc_begin(const void *p) {
   return (const void *)beg;
 }
 
+// ABA: start of the primary-allocator chunk containing p (any offset), or 0.
+// Lock-free: the primary allocator answers by size-class arithmetic. Large
+// (secondary, mmap) blocks lie outside [HeapMemBeg, HeapMemEnd) and return 0.
+uptr AbaHeapBlockBegin(uptr p) {
+  if (p < HeapMemBeg() || p >= HeapMemEnd())
+    return 0;
+  return (uptr)allocator()->GetBlockBegin((void *)p);
+}
+
 // ABA: identity of the heap block containing p at any offset, 0 if none.
 // Used to tell stale pool-slot annotations (their slab was freed) from live.
 u64 AbaHeapHostEpoch(uptr p) {

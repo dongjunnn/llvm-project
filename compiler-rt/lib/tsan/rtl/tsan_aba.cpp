@@ -181,22 +181,21 @@ void AbaPrintStats() {
          (unsigned long long)atomic_load(&g_aba_pool_dropped, memory_order_relaxed));
 }
 
-// Heap block containing p (p may point up to 128 bytes past the block start,
-// e.g. past an allocator header or into an intrusive link field).
+uptr AbaHeapBlockBegin(uptr p);  // tsan_mman.cpp
+
+// Heap block containing p, at any offset. The allocator maps an interior
+// pointer to its chunk start exactly (size-class arithmetic, no scan); the
+// MBlock lives at the chunk start. A pointer into a chunk's slack past the
+// user size, or into a free chunk, has no holder.
 static MBlock *AbaEnclosingBlock(uptr p, uptr *start) {
-  if (p < HeapMemBeg() || p >= HeapMemEnd())
+  uptr beg = AbaHeapBlockBegin(p);
+  if (!beg)
     return nullptr;
-  for (uptr back = 0; back <= 128; back += kMetaShadowCell) {
-    uptr q = RoundDownTo(p, kMetaShadowCell) - back;
-    if (MBlock *b = ctx->metamap.GetBlock(q)) {
-      if (q + b->siz > p) {
-        *start = q;
-        return b;
-      }
-      return nullptr;  // p lies past the end of the nearest block
-    }
-  }
-  return nullptr;
+  MBlock *b = ctx->metamap.GetBlock(beg);
+  if (!b || p >= beg + (b->siz ? b->siz : 1))
+    return nullptr;
+  *start = beg;
+  return b;
 }
 
 static uptr AbaObjectWords(uptr p) {
@@ -338,6 +337,8 @@ u64 AbaLocationEpoch(uptr addr) {
   // Globals and stacks have no identity; skip the meta-map walk for them.
   if (addr < HeapMemBeg() || addr >= HeapMemEnd())
     return 0;
+  // Atomic at the block start (e.g. a list node whose link is its first
+  // field): one meta-map lookup. Otherwise ask the allocator.
   if (MBlock *b = ctx->metamap.GetBlock(addr))
     return b->alloc_epoch;
   uptr start;
