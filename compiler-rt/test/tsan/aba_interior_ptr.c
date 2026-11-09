@@ -1,13 +1,13 @@
 // RUN: %clang_tsan -O1 -DOFFSET=0 %s -o %t-control && %run %t-control 2>&1 | FileCheck %s --check-prefix=CONTROL
 // RUN: %clang_tsan -O1 -DOFFSET=16 %s -o %t-interior && %run %t-interior 2>&1 | FileCheck %s --check-prefix=CONTROL
-// RUN: %clang_tsan -O1 -DOFFSET=200 -DBLOCK=256 %s -o %t-far && %run %t-far 2>&1 | FileCheck %s --check-prefix=LIMIT
+// RUN: %clang_tsan -O1 -DOFFSET=200 -DBLOCK=256 %s -o %t-far && %run %t-far 2>&1 | FileCheck %s --check-prefix=CONTROL
+// RUN: %clang_tsan -O1 -DOFFSET=4000 -DBLOCK=4096 %s -o %t-deep && %run %t-deep 2>&1 | FileCheck %s --check-prefix=CONTROL
 //
 // Interior pointers. The atomic holds a pointer into the middle of a heap
 // block, as intrusive lists do when the link field is not the first member.
-// The epoch lookup resolves pointers up to 128 bytes past the block start to
-// the enclosing block, so OFFSET=0 and OFFSET=16 must both report.
-// LIMITATION (still documented): links more than 128 bytes into the block
-// (OFFSET=200) are not resolved and the ABA is missed.
+// The epoch lookup asks the allocator for the chunk containing the pointer
+// (GetBlockBegin), so a pointer at any offset into the block resolves to the
+// enclosing block: OFFSET=0, 16, 200 and 4000 must all report.
 #include <assert.h>
 #include <pthread.h>
 #include <semaphore.h>
@@ -55,5 +55,3 @@ int main(void) {
 }
 // CONTROL: WARNING: ThreadSanitizer: ABA detected
 // CONTROL: done
-// LIMIT-NOT: ABA detected
-// LIMIT: done
