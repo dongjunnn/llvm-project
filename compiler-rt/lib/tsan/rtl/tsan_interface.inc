@@ -32,6 +32,7 @@ void __tsan_read4(void *addr) {
 
 void __tsan_read8(void *addr) {
   MemoryAccess(cur_thread(), CALLERPC, (uptr)addr, 8, kAccessRead);
+  AbaPlainLoad((uptr)addr, CALLERPC);
 }
 
 void __tsan_read16(void *addr) {
@@ -72,6 +73,7 @@ void __tsan_read4_pc(void *addr, void *pc) {
 
 void __tsan_read8_pc(void *addr, void *pc) {
   MemoryAccess(cur_thread(), STRIP_PAC_PC(pc), (uptr)addr, 8, kAccessRead | kAccessExternalPC);
+  AbaPlainLoad((uptr)addr, STRIP_PAC_PC(pc));
 }
 
 void __tsan_write1_pc(void *addr, void *pc) {
