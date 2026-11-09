@@ -303,6 +303,20 @@ u64 GetPointerEpoch(uptr p) {
 
 atomic_uint64_t g_aba_loc_checked, g_aba_loc_reports;
 
+int g_aba_plain = -1;
+
+void AbaPlainLoadSlow(uptr addr, uptr pc) {
+  if (g_aba_plain < 0) {
+    const char *e = GetEnv("TSAN_ABA_PLAIN");
+    g_aba_plain = (e && e[0] == '1') ? 1 : 0;
+    if (!g_aba_plain)
+      return;
+  }
+  if ((addr & (sizeof(uptr) - 1)) || !IsAppMem(addr))
+    return;
+  AbaRecordLoad(addr, *(volatile uptr *)addr, pc);
+}
+
 bool AbaLocationEnabled() {
   static int v = -1;
   if (v < 0) {
@@ -315,10 +329,12 @@ bool AbaLocationEnabled() {
 u64 AbaLocationEpoch(uptr addr) {
   if (!IsAppMem(addr))
     return 0;
-  // An annotated slot whose first word is the atomic (intrusive next link).
+  // An annotated slot holding the atomic: the nearest slot start at or below
+  // addr, up to 64 bytes back (an intrusive link field inside the slot).
   if (atomic_load(&g_pool_used, memory_order_relaxed))
-    if (u64 e = PoolLookup(addr))
-      return e;
+    for (uptr back = 0; back <= 64 && back <= addr; back += sizeof(uptr))
+      if (u64 e = PoolLookup(addr - back))
+        return e;
   // Globals and stacks have no identity; skip the meta-map walk for them.
   if (addr < HeapMemBeg() || addr >= HeapMemEnd())
     return 0;

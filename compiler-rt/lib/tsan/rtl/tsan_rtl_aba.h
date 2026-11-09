@@ -143,6 +143,17 @@ static inline void AbaRecordLoad(uptr addr, uptr value, uptr pc = 0) {
   slot->pc = pc;
 }
 
+// EXPERIMENT (plain loads): with TSAN_ABA_PLAIN=1, 8-byte plain/volatile reads
+// also record notes, so a CAS whose expected value or holder was read without
+// an atomic load (C code with volatile, `tail->next` field reads, __sync CAS)
+// is checked too. Off by default: one predictable branch per 8-byte read.
+extern int g_aba_plain;  // -1 unknown, 0 off, 1 on
+void AbaPlainLoadSlow(uptr addr, uptr pc);
+static ALWAYS_INLINE void AbaPlainLoad(uptr addr, uptr pc) {
+  if (UNLIKELY(g_aba_plain != 0))
+    AbaPlainLoadSlow(addr, pc);
+}
+
 // The atomic was changed in a way we don't model (fetch-op): drop the note.
 static inline void AbaForget(uptr addr) {
   AbaEntry *set = aba_cache.sets[AbaSetIndex(addr)];
