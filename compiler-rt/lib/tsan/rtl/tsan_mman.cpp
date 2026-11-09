@@ -397,6 +397,18 @@ static const void *user_alloc_begin(const void *p) {
   return (const void *)beg;
 }
 
+// ABA: identity of the heap block containing p at any offset, 0 if none.
+// Used to tell stale pool-slot annotations (their slab was freed) from live.
+u64 AbaHeapHostEpoch(uptr p) {
+  if (!IsAppMem(p) || p < HeapMemBeg() || p >= HeapMemEnd())
+    return 0;
+  void *beg = allocator()->GetBlockBegin((void *)p);
+  if (!beg)
+    return 0;
+  MBlock *b = ctx->metamap.GetBlock((uptr)beg);
+  return b ? b->alloc_epoch : 0;
+}
+
 uptr user_alloc_usable_size(const void *p) {
   if (p == 0 || !IsAppMem((uptr)p))
     return 0;
