@@ -53,7 +53,13 @@ void AbaReportLocation(uptr addr, uptr expected, uptr desired, u64 then, u64 now
 // EXPERIMENT: true if the object at `desired` holds the pointer `expected` in
 // one of its words -- the signature of a push-style CAS (n->next == expected),
 // which only uses the old object's address and so tolerates ABA.
-bool AbaDesiredLinksTo(uptr desired, uptr expected);
+// pop_like: desired was read out of the expected object at load time (it is
+// one of the words snapshotted then), so this is a pop and the push filter,
+// which would match a stale link left inside a recycled desired, must not apply.
+bool AbaDesiredLinksTo(uptr desired, uptr expected, bool pop_like = false);
+// Snapshot the first kAbaSnapWords words of the object at value (tracked only).
+static const uptr kAbaSnapWords = 2;
+void AbaSnapshot(uptr value, uptr *snap);
 void AbaPrintPc(const char *what, uptr pc, uptr cas_pc);
 void AbaDebugObject(const char *what, uptr p);
 extern atomic_uint64_t g_aba_push_suppressed;
@@ -74,6 +80,7 @@ struct AbaEntry {
   uptr loaded_ptr;  // pointer value observed at load
   u64  epoch;       // its alloc epoch at load time (0: value untracked)
   u64  loc_epoch;   // identity of the object holding the atomic (0: none)
+  uptr snap[kAbaSnapWords];  // first words of the loaded object at load time
   u32  lru;         // last-touch tick, for eviction
   uptr pc;          // EXPERIMENT: caller pc of the recording op
 };
@@ -128,6 +135,10 @@ static inline void AbaRecordLoad(uptr addr, uptr value, uptr pc = 0) {
   slot->loaded_ptr = value;
   slot->epoch = epoch;
   slot->loc_epoch = loc;
+  if (epoch)
+    AbaSnapshot(value, slot->snap);
+  else
+    for (uptr i = 0; i < kAbaSnapWords; i++) slot->snap[i] = 0;
   slot->lru = ++aba_cache.tick;
   slot->pc = pc;
 }
@@ -167,7 +178,11 @@ static inline void AbaCheckCas(uptr addr, uptr expected, uptr desired, uptr pc =
     return;  // value untracked: only the location could be checked
   atomic_fetch_add(&g_aba_cas_checked, 1, memory_order_relaxed);
   u64 now = GetPointerEpoch(expected);
-  if (now != e->epoch && AbaDesiredLinksTo(desired, expected)) {
+  bool pop_like = false;
+  for (uptr i = 0; i < kAbaSnapWords; i++)
+    if (desired && e->snap[i] == desired)
+      pop_like = true;
+  if (now != e->epoch && AbaDesiredLinksTo(desired, expected, pop_like)) {
     atomic_fetch_add(&g_aba_push_suppressed, 1, memory_order_relaxed);
     e->addr = 0;
     return;
