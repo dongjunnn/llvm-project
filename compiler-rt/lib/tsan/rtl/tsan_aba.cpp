@@ -39,16 +39,32 @@ THREADLOCAL u64 aba_report_count;
 // an identity change and reports falsely. Overflowing the window drops the
 // insert instead, costing only a missed detection.
 
-static const uptr kPoolSize = 1 << 16;  // 64Ki entries, 1MB, lazily faulted
+// 1Mi entries (24MB of BSS, faulted in only where touched): a program that
+// annotates every node of long-lived queues re-stamps rather than removes, so
+// live entries accumulate up to the number of nodes ever annotated.
+static const uptr kPoolSize = 1 << 20;
 static const uptr kPoolMask = kPoolSize - 1;
+static const uptr kPoolHashShift = 64 - 20;
 static const uptr kPoolProbe = 8;
 
 struct PoolSlot {
   atomic_uintptr_t addr;  // 0 == empty
   atomic_uint64_t epoch;
+  atomic_uint64_t host;   // epoch of the heap block holding the slot, or 0
 };
 
+u64 AbaHeapHostEpoch(uptr p);  // tsan_mman.cpp
+
+// An entry is stale when the heap block that held its slot was freed (and
+// maybe reallocated): the annotations for it can never be removed now.
+// Checked only when an insert finds its probe window full.
+static inline bool PoolSlotStale(PoolSlot *s, uptr addr) {
+  u64 host = atomic_load(&s->host, memory_order_relaxed);
+  return host != 0 && AbaHeapHostEpoch(addr) != host;
+}
+
 static PoolSlot g_pool_map[kPoolSize];
+static atomic_uint64_t g_aba_pool_dropped;
 
 // Stays 0 until the first annotation, so unannotated programs pay one relaxed
 // load per lookup instead of walking the probe window.
@@ -57,35 +73,45 @@ static atomic_uint32_t g_pool_used;
 static inline uptr PoolHash(uptr p) {
   // Fibonacci hashing; the high product bits mix in the low address bits that
   // distinguish adjacent slots.
-  return (uptr)(((u64)p * 0x9E3779B97F4A7C15ull) >> 47) & kPoolMask;
+  return (uptr)(((u64)p * 0x9E3779B97F4A7C15ull) >> kPoolHashShift) & kPoolMask;
 }
 
 static void PoolInsert(uptr p, u64 epoch) {
   uptr h = PoolHash(p);
+  u64 host = AbaHeapHostEpoch(p);
   // Re-stamp an existing entry for p first; claiming an earlier hole would
   // leave a stale duplicate that resurfaces after the next remove.
   for (uptr i = 0; i < kPoolProbe; i++) {
     PoolSlot *s = &g_pool_map[(h + i) & kPoolMask];
     if (atomic_load(&s->addr, memory_order_acquire) == p) {
+      atomic_store(&s->host, host, memory_order_relaxed);
       atomic_store(&s->epoch, epoch, memory_order_release);
       return;
     }
   }
-  for (uptr i = 0; i < kPoolProbe; i++) {
-    PoolSlot *s = &g_pool_map[(h + i) & kPoolMask];
-    uptr cur = atomic_load(&s->addr, memory_order_acquire);
-    if (cur != 0 && cur != p)
-      continue;  // taken by another address
-    // On a lost race cur holds the winner's address; if it claimed p too,
-    // the slot is still ours to stamp.
-    if (cur == 0 &&
-        !atomic_compare_exchange_strong(&s->addr, &cur, p,
-                                        memory_order_acq_rel) &&
-        cur != p)
-      continue;
-    atomic_store(&s->epoch, epoch, memory_order_release);
-    return;
+  for (int pass = 0; pass < 2; pass++) {
+    for (uptr i = 0; i < kPoolProbe; i++) {
+      PoolSlot *s = &g_pool_map[(h + i) & kPoolMask];
+      uptr cur = atomic_load(&s->addr, memory_order_acquire);
+      // Pass 1 reclaims entries whose slab was freed: without this, slots of
+      // destroyed pools fill the window and later inserts are dropped.
+      if (cur != 0 && cur != p && !(pass == 1 && PoolSlotStale(s, cur)))
+        continue;  // taken by another address
+      // On a lost race cur holds the winner's address; if it claimed p too,
+      // the slot is still ours to stamp.
+      uptr want = cur;
+      if (cur != p &&
+          !atomic_compare_exchange_strong(&s->addr, &cur, p,
+                                          memory_order_acq_rel) &&
+          cur != p)
+        continue;
+      (void)want;
+      atomic_store(&s->host, host, memory_order_relaxed);
+      atomic_store(&s->epoch, epoch, memory_order_release);
+      return;
+    }
   }
+  atomic_fetch_add(&g_aba_pool_dropped, 1, memory_order_relaxed);
 }
 
 static void PoolRemove(uptr p) {
@@ -105,6 +131,8 @@ static u64 PoolLookup(uptr p) {
   for (uptr i = 0; i < kPoolProbe; i++) {
     PoolSlot *s = &g_pool_map[(h + i) & kPoolMask];
     if (atomic_load(&s->addr, memory_order_acquire) == p)
+      // Not validated against the host block here (hot path): a stale entry
+      // only returns a constant epoch, which can hide ABA but never report it.
       return atomic_load(&s->epoch, memory_order_acquire);
   }
   return 0;
@@ -138,7 +166,7 @@ void AbaPrintPc(const char *what, uptr pc, uptr cas_pc) {
 void AbaPrintStats() {
   Printf("ABA stats: ptr-sized loads=%llu tracked=%llu cas-checked=%llu "
          "reports=%llu suppressed=%llu (mark=%llu push=%llu consistent=%llu) freed-token=%llu "
-         "loc-checked=%llu loc-reports=%llu\n",
+         "loc-checked=%llu loc-reports=%llu pool-dropped=%llu\n",
          (unsigned long long)atomic_load(&g_aba_loads, memory_order_relaxed),
          (unsigned long long)atomic_load(&g_aba_loads_tracked, memory_order_relaxed),
          (unsigned long long)atomic_load(&g_aba_cas_checked, memory_order_relaxed),
@@ -149,7 +177,8 @@ void AbaPrintStats() {
          (unsigned long long)atomic_load(&g_aba_benign[2], memory_order_relaxed),
          (unsigned long long)atomic_load(&g_aba_freed_suppressed, memory_order_relaxed),
          (unsigned long long)atomic_load(&g_aba_loc_checked, memory_order_relaxed),
-         (unsigned long long)atomic_load(&g_aba_loc_reports, memory_order_relaxed));
+         (unsigned long long)atomic_load(&g_aba_loc_reports, memory_order_relaxed),
+         (unsigned long long)atomic_load(&g_aba_pool_dropped, memory_order_relaxed));
 }
 
 // Heap block containing p (p may point up to 128 bytes past the block start,
